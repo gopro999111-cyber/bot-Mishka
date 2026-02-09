@@ -8,16 +8,21 @@ const AUTH_URL = "https://grnd.gg/auth";
 const COMPLAINTS_URL = "https://grnd.gg/admin/complaints";
 
 // ====== НАСТРОЙКИ ======
-const CHECK_INTERVAL = 30_000; // 30 секунд
+const CHECK_INTERVAL = 30_000;
 const STORAGE_FILE = "notified_ids.json";
 const AUTH_FILE = "auth.json";
+
+// ⚠️ ВАЖНО:
+// - На Railway должно быть true (иначе нет XServer)
+// - Локально для ручной авторизации можешь временно поставить false
+const HEADLESS = true;
 
 // ====== DISCORD (уведомления) ======
 const DISCORD_WEBHOOK =
   "https://discord.com/api/webhooks/1470341874563940498/5OjK0mcdyYjDCaimUUjZnGbLlKm--ttnJoGFZtRQWlIOVorC7_rV-5ILe0JP4wxEWfor";
 const DISCORD_ROLE_ID = "1470322549224378450";
 
-// ====== БЕЗОПАСНОСТЬ ПРОЦЕССА ======
+// ====== SAFETY ======
 process.on("unhandledRejection", err => {
   console.error("❌ UNHANDLED REJECTION:", err?.stack || err);
 });
@@ -83,7 +88,7 @@ async function sendDiscord(c) {
   throw new Error("Discord webhook failed after retries (429)");
 }
 
-// ====== ИЗВЛЕЧЕНИЕ ЖАЛОБ ======
+// ====== GET COMPLAINTS ======
 async function getComplaints(page) {
   await page.waitForSelector(".table-component-index table", { timeout: 15000 });
 
@@ -103,51 +108,46 @@ async function getComplaints(page) {
   });
 }
 
-// ====== ПРОХОДИМ /auth И СОЗДАЁМ auth.json ======
+// ====== ensure auth via /auth (для локального первого входа) ======
 async function ensureSiteAuth(context, page) {
   console.log("🌐 Иду на авторизацию сайта:", AUTH_URL);
   await page.goto(AUTH_URL, { waitUntil: "domcontentloaded" });
 
-  const deadline = Date.now() + 120_000; // 2 минуты на авторизацию
+  const deadline = Date.now() + 120_000;
 
   while (Date.now() < deadline) {
     const u = page.url();
 
-    // Если нас уже пустило на /admin или конкретно на complaints — успех
     if (u.includes("grnd.gg/admin")) {
-      console.log("✅ Сайт авторизован, текущий URL:", u);
+      console.log("✅ Сайт авторизован, URL:", u);
       await context.storageState({ path: AUTH_FILE });
       console.log("✅ auth.json сохранён");
       return;
     }
 
-    // Если выкинуло на Discord OAuth — попробуем нажать Authorize
     if (u.includes("discord.com/oauth2") || u.includes("discord.com/authorize")) {
       const btn = page.locator(
-        'button:has-text("Authorize"), button:has-text("Авторизовать"), button:has-text("Продолжить"), button:has-text("Continue")'
+        'button:has-text("Authorize"), button:has-text("Авторизовать"), button:has-text("Continue"), button:has-text("Продолжить")'
       );
 
       if (await btn.count()) {
         try {
-          console.log("➡️ Нажимаю кнопку Authorize/Continue...");
+          console.log("➡️ Нажимаю Authorize/Continue...");
           await btn.first().click({ timeout: 2000 });
         } catch {}
       }
     }
 
-    // Иногда появляется капча/2FA/подтверждение — тогда просто руками
     await page.waitForTimeout(1200);
   }
 
-  // На всякий случай сохраним то, что есть, но сообщим об ошибке
   await context.storageState({ path: AUTH_FILE }).catch(() => {});
-  throw new Error("Не удалось завершить авторизацию на grnd.gg через /auth за 2 минуты (возможно, нужно ручное подтверждение/капча).");
+  throw new Error("Не удалось завершить авторизацию на grnd.gg через /auth за 2 минуты.");
 }
 
 // ====== MAIN ======
 (async () => {
-  // Первый запуск лучше headless:false, чтобы ты мог руками подтвердить/капчу пройти
-  const browser = await chromium.launch({ headless: false });
+  const browser = await chromium.launch({ headless: HEADLESS });
 
   let context;
   let page;
@@ -157,14 +157,18 @@ async function ensureSiteAuth(context, page) {
     context = await browser.newContext({ storageState: AUTH_FILE });
     page = await context.newPage();
   } else {
-    console.log("🆕 auth.json нет — делаю первый вход (Discord + grnd.gg/auth)");
+    console.log("🆕 auth.json нет — делаю первый вход (локально). На Railway так не делай.");
     context = await browser.newContext();
     page = await context.newPage();
 
-    // 1) Логин в Discord (чтобы OAuth прошёл быстро)
+    // Discord login (нужен для OAuth на сайте)
     await login(page);
 
-    // 2) Авторизация сайта через /auth
+    // гарантированно идём на /auth
+    console.log("➡️ После Discord логина открываю сайт /auth");
+    await page.goto(AUTH_URL, { waitUntil: "domcontentloaded" });
+
+    // руками/кнопкой Authorize и т.п. (в headless=true это почти не работает)
     await ensureSiteAuth(context, page);
   }
 
